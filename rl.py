@@ -1,12 +1,14 @@
 """
-Reinforcement Learning Trading System
------------------------------------
-This script implements a reinforcement learning approach for pairs trading.
-It uses the Engle-Granger cointegration method to identify trading opportunities
-and trains an RL agent to optimize trading parameters.
+Enhanced Reinforcement Learning Trading System
+-------------------------------------------
+Added features:
+1. Model saving and loading
+2. Enhanced backtesting with capital management
+3. Detailed performance metrics
 """
 
 import warnings
+import os
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -22,42 +24,23 @@ from Cointegration import EGCointegration
 warnings.simplefilter('ignore')
 
 def load_and_prepare_data(x_path, y_path, train_split=0.7):
-    """
-    Load price data and split into training and testing sets.
-    
-    Args:
-        x_path (str): Path to first asset price data
-        y_path (str): Path to second asset price data
-        train_split (float): Fraction of data to use for training
-        
-    Returns:
-        tuple: Training and testing cointegration objects
-    """
-    # Load price data
+    """Load and prepare data for training and testing"""
     x = pd.read_csv(x_path)
     y = pd.read_csv(y_path)
     
-    # Clean and prepare data
     x, y = EGCointegration.clean_data(x, y, 'date', 'close')
     
-    # Split into training and testing sets
     train_len = round(len(x) * train_split)
     idx_train = list(range(0, train_len))
     idx_test = list(range(train_len, len(x)))
     
-    # Create cointegration objects
     eg_train = EGCointegration(x.iloc[idx_train, :], y.iloc[idx_train, :], 'date', 'close')
     eg_test = EGCointegration(x.iloc[idx_test, :], y.iloc[idx_test, :], 'date', 'close')
     
     return eg_train, eg_test
 
 def create_action_space():
-    """
-    Define the action space for the reinforcement learning agent.
-    
-    Returns:
-        dict: Action space parameters
-    """
+    """Define the action space parameters"""
     return {
         'n_hist': list(np.arange(60, 601, 60)),      # Historical window size
         'n_forward': list(np.arange(120, 1201, 120)), # Trading window size
@@ -67,17 +50,7 @@ def create_action_space():
     }
 
 def create_network(n_state, n_action):
-    """
-    Create the neural network architecture for the RL agent.
-    
-    Args:
-        n_state (int): Number of states
-        n_action (int): Number of possible actions
-        
-    Returns:
-        tuple: Network object and input placeholder
-    """
-    # Define network layers
+    """Create the neural network architecture"""
     one_hot = {
         'one_hot': {
             'func_name': 'one_hot',
@@ -103,7 +76,6 @@ def create_network(n_state, n_action):
         }
     }
     
-    # Create network
     state_in = tf.placeholder(shape=[1], dtype=tf.int32)
     network = basics.Network(state_in)
     network.build_layers(one_hot)
@@ -112,12 +84,7 @@ def create_network(n_state, n_action):
     return network, state_in
 
 def get_training_config():
-    """
-    Define the configuration for training the RL agent.
-    
-    Returns:
-        dict: Training configuration parameters
-    """
+    """Define training configuration"""
     return {
         'StateSpaceState': {'transaction_cost': [0.001]},
         'ActionSpaceAction': create_action_space(),
@@ -168,12 +135,7 @@ def get_training_config():
     }
 
 def plot_action_values(qvalues):
-    """
-    Plot the evolution of action values during training.
-    
-    Args:
-        qvalues (numpy.array): Array of action values over time
-    """
+    """Plot the evolution of action values during training"""
     steps, action_value = qvalues.shape
     time_steps, dimensions = np.meshgrid(np.arange(steps), np.arange(action_value))
     
@@ -187,27 +149,50 @@ def plot_action_values(qvalues):
     ax.view_init(elev=80, azim=270)
     plt.show()
 
-def backtest_model(session, agent, test_engine, opt_action):
-    """
-    Perform backtesting of the trained model.
+def calculate_performance_metrics(pnl):
+    """Calculate comprehensive performance metrics"""
+    metrics = {}
     
-    Args:
-        session: TensorFlow session
-        agent: Trained RL agent
-        test_engine: Test dataset
-        opt_action: Optimal action from training
-        
-    Returns:
-        pandas.DataFrame: Backtesting results
-    """
+    # Basic return metrics
+    metrics['Total Return'] = (pnl['Capital'].iloc[-1] - pnl['Capital'].iloc[0]) / pnl['Capital'].iloc[0]
+    
+    # Trading metrics
+    metrics['Number of Trades'] = (pnl['N_Trade'] != 0).sum()
+    metrics['Win Rate'] = (pnl['Trade_Profit'] > 0).sum() / metrics['Number of Trades']
+    
+    # Risk metrics
+    returns = pnl['Capital'].pct_change().dropna()
+    metrics['Volatility'] = returns.std() * np.sqrt(252)
+    metrics['Sharpe Ratio'] = returns.mean() / returns.std() * np.sqrt(252)
+    
+    # Drawdown analysis
+    cummax = pnl['Capital'].cummax()
+    drawdown = (pnl['Capital'] - cummax) / cummax
+    metrics['Max Drawdown'] = drawdown.min()
+    
+    # Position analysis
+    metrics['Avg Position Size'] = pnl['Position_Value'].mean()
+    metrics['Max Position Size'] = pnl['Position_Value'].max()
+    
+    return pd.Series(metrics)
+
+def enhanced_backtest_model(session, agent, test_engine, opt_action, initial_capital=1000000):
+    """Enhanced backtesting with capital management"""
     action_dict = agent.action_space.convert(opt_action, 'index_to_dict')
     indices = range(action_dict['n_hist'] + 1, len(test_engine.x) - action_dict['n_forward'], 10)
     
+    # Initialize tracking dataframe
     pnl = pd.DataFrame()
     pnl['Time'] = test_engine.timestamp
+    pnl['Capital'] = initial_capital
     pnl['Trade_Profit'] = 0
     pnl['Cost'] = 0
     pnl['N_Trade'] = 0
+    pnl['Position_Value'] = 0
+    pnl['Risk_Level'] = 0
+    
+    current_capital = initial_capital
+    max_position_size = initial_capital * 0.1  # Max 10% per position
     
     for i in indices:
         test_engine.process(index=i, transaction_cost=0.001, **action_dict)
@@ -216,25 +201,54 @@ def backtest_model(session, agent, test_engine, opt_action):
         if trade_record is not None and len(trade_record) > 0:
             trade_record = pd.DataFrame(trade_record)
             
-            # Calculate trade metrics
-            trade_cost = trade_record.groupby('trade_time')['trade_cost'].sum()
-            close_cost = trade_record.groupby('close_time')['close_cost'].sum()
-            profit = trade_record.groupby('close_time')['profit'].sum()
+            # Position sizing based on current capital
+            position_size = min(max_position_size, current_capital * 0.1)
+            
+            # Calculate trade metrics with position sizing
+            trade_cost = trade_record.groupby('trade_time')['trade_cost'].sum() * position_size
+            close_cost = trade_record.groupby('close_time')['close_cost'].sum() * position_size
+            profit = trade_record.groupby('close_time')['profit'].sum() * position_size
             open_pos = trade_record.groupby('trade_time')['long_short'].sum()
             close_pos = trade_record.groupby('close_time')['long_short'].sum() * -1
             
             # Update PnL dataframe
-            pnl.loc[pnl['Time'].isin(trade_cost.index), 'Cost'] += trade_cost.values
-            pnl.loc[pnl['Time'].isin(close_cost.index), 'Cost'] += close_cost.values
-            pnl.loc[pnl['Time'].isin(close_cost.index), 'Trade_Profit'] += profit.values
-            pnl.loc[pnl['Time'].isin(trade_cost.index), 'N_Trade'] += open_pos.values
-            pnl.loc[pnl['Time'].isin(close_cost.index), 'N_Trade'] += close_pos.values
+            for time in trade_cost.index:
+                idx = pnl[pnl['Time'] == time].index[0]
+                pnl.loc[idx, 'Cost'] += trade_cost[time]
+                pnl.loc[idx, 'N_Trade'] += open_pos[time]
+                pnl.loc[idx, 'Position_Value'] += position_size
+                current_capital -= trade_cost[time]
+                pnl.loc[idx:, 'Capital'] = current_capital
+            
+            for time in close_cost.index:
+                idx = pnl[pnl['Time'] == time].index[0]
+                pnl.loc[idx, 'Cost'] += close_cost[time]
+                pnl.loc[idx, 'Trade_Profit'] += profit[time]
+                pnl.loc[idx, 'N_Trade'] += close_pos[time]
+                pnl.loc[idx, 'Position_Value'] -= position_size
+                current_capital += profit[time] - close_cost[time]
+                pnl.loc[idx:, 'Capital'] = current_capital
     
-    pnl['PnL'] = (pnl['Trade_Profit'] - pnl['Cost']).cumsum()
+    pnl['Risk_Level'] = pnl['Position_Value'] / pnl['Capital']
     return pnl
+
+def save_model(session, rl_agent, model_path):
+    """Save the trained model"""
+    if not os.path.exists(os.path.dirname(model_path)):
+        os.makedirs(os.path.dirname(model_path))
+    rl_agent.saver.save(session, model_path)
+    print(f"Model saved to {model_path}")
+
+def load_model(session, rl_agent, model_path):
+    """Load a trained model"""
+    rl_agent.saver.restore(session, model_path)
+    print(f"Model loaded from {model_path}")
 
 def main():
     """Main execution function"""
+    # Model paths
+    MODEL_DIR = "models"
+    MODEL_PATH = os.path.join(MODEL_DIR, "rl_trader_model")
     
     # Load and prepare data
     eg_train, eg_test = load_and_prepare_data('DATA/P.csv', 'DATA/Y.csv')
@@ -248,10 +262,18 @@ def main():
     network, _ = create_network(n_state, n_action)
     config = get_training_config()
     
-    # Initialize and train the RL agent
+    # Initialize RL agent
     rl_train = RL.Trader(network, config, eg_train)
+    
     with tf.Session() as sess:
-        rl_train.process(sess)
+        # Check if model exists
+        if os.path.exists(MODEL_PATH + ".index"):
+            print("Loading existing model...")
+            load_model(sess, rl_train, MODEL_PATH)
+        else:
+            print("Training new model...")
+            rl_train.process(sess)
+            save_model(sess, rl_train, MODEL_PATH)
         
         # Plot training results
         qvalue_ = np.array(rl_train.exploration.qvalue_)
@@ -271,15 +293,38 @@ def main():
         [opt_action] = sess.run([rl_train.output], feed_dict=rl_train.feed_dict)
         opt_action = np.argmax(opt_action)
         
-        pnl = backtest_model(sess, rl_train, eg_test, opt_action)
+        # Run enhanced backtesting
+        pnl = enhanced_backtest_model(sess, rl_train, eg_test, opt_action)
+        
+        # Calculate and display performance metrics
+        metrics = calculate_performance_metrics(pnl)
+        print("\nBacktesting Results:")
+        print("===================")
+        for metric, value in metrics.items():
+            print(f"{metric}: {value:.4f}")
         
         # Plot backtesting results
-        plt.figure(figsize=(12, 6))
-        plt.plot(pnl['PnL'])
-        plt.title('Cumulative Profit and Loss')
-        plt.xlabel('Time')
-        plt.ylabel('PnL')
-        plt.legend(['Profit'])
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 15))
+        
+        # Plot capital curve
+        ax1.plot(pnl['Time'], pnl['Capital'])
+        ax1.set_title('Capital Curve')
+        ax1.set_xlabel('Time')
+        ax1.set_ylabel('Capital')
+        
+        # Plot position value
+        ax2.plot(pnl['Time'], pnl['Position_Value'])
+        ax2.set_title('Position Value Over Time')
+        ax2.set_xlabel('Time')
+        ax2.set_ylabel('Position Value')
+        
+        # Plot risk level
+        ax3.plot(pnl['Time'], pnl['Risk_Level'])
+        ax3.set_title('Risk Level Over Time')
+        ax3.set_xlabel('Time')
+        ax3.set_ylabel('Risk Level')
+        
+        plt.tight_layout()
         plt.show()
 
 if __name__ == "__main__":
